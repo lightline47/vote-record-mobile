@@ -315,44 +315,21 @@ def table_election_name_text(name):
     return original
 
 def _load_persistent_password(store_key, local_file, session_key):
-    """Supabase 우선, 로컬 보조본 차순위로 비밀번호를 불러옵니다."""
-    # 다른 기기/브라우저에서 변경한 값도 즉시 반영되도록 원격값을 매번 우선 확인합니다.
-    if supabase_persistence_ready():
-        try:
-            remote = load_persistent_json(store_key)
-            if isinstance(remote, dict):
-                password = str(remote.get("password", "") or "").strip()
-                if password:
-                    st.session_state[session_key] = password
-                    # 현재 실행 인스턴스에도 보조본을 남깁니다.
-                    try:
-                        local_file.write_text(
-                            json.dumps({"password": password}, ensure_ascii=False, indent=2),
-                            encoding="utf-8",
-                        )
-                    except Exception:
-                        pass
-                    return password
-        except Exception as exc:
-            st.session_state["password_persistence_warning"] = str(exc)
-
-    # 이전 버전에서 저장한 로컬 비밀번호가 있으면 마이그레이션 대상으로 사용합니다.
-    password = ""
-    if local_file.exists():
-        try:
-            data = json.loads(local_file.read_text(encoding="utf-8"))
-            password = str(data.get("password", "") or "").strip()
-        except Exception:
-            password = ""
-    password = password or "1234"
+    """원격 비밀번호만 신뢰합니다. 장애 시 기본값으로 로그인시키지 않습니다."""
+    if not supabase_persistence_ready():
+        st.error("Supabase 연결 설정이 없어 로그인할 수 없습니다. 기존 비밀번호는 변경되지 않았습니다.")
+        st.stop()
+    try:
+        remote = load_persistent_json(store_key)
+    except Exception as exc:
+        st.error("Supabase 연결 장애로 비밀번호를 확인할 수 없습니다. 복구 후 다시 접속해 주세요.")
+        st.session_state["password_persistence_warning"] = str(exc)
+        st.stop()
+    if not isinstance(remote, dict) or not str(remote.get("password", "") or "").strip():
+        st.error("저장된 비밀번호를 찾지 못했습니다. 자동으로 1234를 설정하지 않습니다. 관리자에게 확인해 주세요.")
+        st.stop()
+    password = str(remote["password"]).strip()
     st.session_state[session_key] = password
-
-    # 원격 행이 아직 없는 최초 실행이면 현재 값을 Supabase에 등록합니다.
-    if supabase_persistence_ready():
-        try:
-            save_persistent_json(store_key, {"password": password})
-        except Exception as exc:
-            st.session_state["password_persistence_warning"] = str(exc)
     return password
 
 
@@ -1957,52 +1934,28 @@ def parse_uploaded_xlsx(file_bytes):
     return station_db, parsed_count
 
 def load_db():
-    # 1순위: Supabase 영구저장 자료. Streamlit 재시작·재배포와 무관하게 유지됩니다.
-    if supabase_persistence_ready():
+    """Supabase가 정상 응답할 때만 등록자료 유무를 판단합니다."""
+    if not supabase_persistence_ready():
+        st.error("Supabase 연결 설정이 없어 엑셀 자료를 확인할 수 없습니다. 자료는 초기화되지 않았습니다.")
+        st.stop()
+    try:
+        loaded = load_persistent_json(STATION_DB_STORE_KEY)
+    except Exception as exc:
+        st.session_state["persistence_load_warning"] = str(exc)
+        st.error("Supabase 연결 장애로 기존 엑셀 자료를 확인할 수 없습니다. 자료를 다시 업로드하지 말고 연결 복구 후 새로고침하세요.")
+        st.stop()
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        st.error("엑셀 저장자료 형식이 올바르지 않습니다. 기존 자료를 덮어쓰지 않도록 중단합니다.")
+        st.stop()
+    if loaded:
         try:
-            loaded = load_persistent_json(STATION_DB_STORE_KEY)
-            if isinstance(loaded, dict) and loaded:
-                # 정상 원격자료를 로컬 보조본에도 복구해 둡니다.
-                try:
-                    DB_FILE.write_text(
-                        json.dumps(loaded, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                except Exception:
-                    pass
-                if supabase_persistence_ready():
-                    try:
-                        save_persistent_json(STATION_DB_STORE_KEY, loaded)
-                    except Exception as exc:
-                        st.session_state["persistence_load_warning"] = str(exc)
-                return loaded
-        except Exception as exc:
-            # 일시적인 네트워크 장애 때는 로컬 보조본으로 계속 진행합니다.
-            st.session_state["persistence_load_warning"] = str(exc)
+            DB_FILE.write_text(json.dumps(loaded, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    return loaded
 
-    # 2순위: 같은 실행 인스턴스에 남아 있는 로컬 보조본
-    if DB_FILE.exists():
-        try:
-            loaded = json.loads(DB_FILE.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict) and loaded:
-                return loaded
-        except Exception:
-            pass
-    # 주 저장파일이 없거나 손상된 경우, 관리자가 마지막으로 정상 등록했던
-    # 백업자료를 사용합니다. 앱 재실행만으로 등록자료가 초기화되지 않습니다.
-    if DB_BACKUP_FILE.exists():
-        try:
-            backup = json.loads(DB_BACKUP_FILE.read_text(encoding="utf-8"))
-            if isinstance(backup, dict) and backup:
-                if supabase_persistence_ready():
-                    try:
-                        save_persistent_json(STATION_DB_STORE_KEY, backup)
-                    except Exception as exc:
-                        st.session_state["persistence_load_warning"] = str(exc)
-                return backup
-        except Exception:
-            pass
-    return {}
 
 def save_db(db):
     if not isinstance(db, dict) or not db:
@@ -2036,24 +1989,26 @@ def delete_db_by_admin():
     DB_BACKUP_FILE.unlink(missing_ok=True)
 
 def load_local():
-    if supabase_persistence_ready():
-        try:
-            loaded = load_persistent_json(LOCAL_DATA_STORE_KEY)
-            if isinstance(loaded, dict):
-                return loaded
-        except Exception as exc:
-            st.session_state["persistence_local_warning"] = str(exc)
-    if LOCAL_FILE.exists():
-        try:
-            return json.loads(LOCAL_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"selected_key": None, "hourly_by_station": {}, "record_inputs_by_station": {}}
+    """원격 조회 오류를 빈 입력자료로 오인하지 않습니다."""
+    if not supabase_persistence_ready():
+        st.error("Supabase 연결 설정이 없어 입력자료를 확인할 수 없습니다.")
+        st.stop()
+    try:
+        loaded = load_persistent_json(LOCAL_DATA_STORE_KEY)
+    except Exception as exc:
+        st.session_state["persistence_local_warning"] = str(exc)
+        st.error("Supabase 연결 장애로 기존 입력자료를 불러올 수 없습니다. 연결 복구 후 다시 접속하세요.")
+        st.stop()
+    if loaded is None:
+        return {"selected_key": None, "hourly_by_station": {}, "record_inputs_by_station": {}}
+    if not isinstance(loaded, dict):
+        st.error("입력자료 형식 오류로 데이터 처리를 중단했습니다.")
+        st.stop()
+    return loaded
 
-if "station_db" not in st.session_state:
-    st.session_state.station_db = load_db()
-if "local_data" not in st.session_state:
-    st.session_state.local_data = load_local()
+
+st.session_state.station_db = load_db()
+st.session_state.local_data = load_local()
 
 def save_local():
     # 사용자 입력자료도 Supabase에 저장하여 앱 재실행 후 복원합니다.
